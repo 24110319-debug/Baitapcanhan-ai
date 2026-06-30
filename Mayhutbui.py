@@ -74,23 +74,78 @@ QUAN_DATA = {
 }
 CSP_VARIABLES = list(QUAN_DATA.keys())
 
+# Các action_type của 3 chế độ giải CSP Tô màu bản đồ TP.HCM
+HCMC_CSP_MODES = ("hcmc_csp", "hcmc_simple", "hcmc_ac3")
+HCMC_MODE_MAP = {"hcmc_simple": "simple", "hcmc_csp": "fc", "hcmc_ac3": "ac3"}
+
 # Gioi han vong lap thuat toan
 IDA_STAR_MAX_LOOPS   = 30000
 BEAM_SEARCH_MAX_ITER = 300
 
 class CSPState:
-    def __init__(self):
+    """
+    mode:
+      - 'simple' : Backtracking thường (không rút gọn miền giá trị của hàng xóm)
+      - 'fc'     : Backtracking + Forward Checking (rút gọn miền hàng xóm trực tiếp khi gán)
+      - 'ac3'    : Backtracking + AC-3 Inference (forward checking + lan truyền AC-3
+                   toàn cục để phát hiện thất bại sớm hơn qua các ràng buộc bắc cầu)
+    """
+    def __init__(self, mode='fc'):
+        self.mode = mode
         self.assignment = {}
         self.domains = {v: COLOR_NAMES.copy() for v in CSP_VARIABLES}
         self.history = []
         self.current_variable = None
-        self.logs = ["Khởi tạo CSP Tô màu bản đồ TP.HCM...", "Phân hoạch = {}"]
+        mode_label = {"simple": "Backtracking thường", "fc": "Backtracking + Forward Checking", "ac3": "Backtracking + AC-3 Inference"}
+        self.logs = [f"Khởi tạo CSP Tô màu bản đồ TP.HCM [{mode_label.get(mode, mode)}]...", "Phân hoạch = {}"]
         self.done = False
 
     def is_consistent(self, var, color):
         for neighbor in QUAN_DATA[var]["adj"]:
             if neighbor in self.assignment and self.assignment[neighbor] == color:
                 return False
+        return True
+
+    def _revise(self, xi, xj):
+        """AC-3: loại khỏi domain[xi] những giá trị không còn nhất quán với xj (ràng buộc != )."""
+        revised = False
+        new_di = []
+        for x in self.domains[xi]:
+            if xj in self.assignment:
+                ok = (x != self.assignment[xj])
+            else:
+                ok = any(y != x for y in self.domains[xj])
+            if ok:
+                new_di.append(x)
+            else:
+                revised = True
+        if revised:
+            self.domains[xi] = new_di
+        return revised
+
+    def ac3(self):
+        """Lan truyền AC-3 trên toàn bộ đồ thị ràng buộc còn lại. Trả về False nếu phát hiện miền rỗng."""
+        queue = deque()
+        for v in CSP_VARIABLES:
+            if v in self.assignment:
+                continue
+            for n in QUAN_DATA[v]["adj"]:
+                queue.append((v, n))
+        arcs_revised = 0
+        while queue:
+            xi, xj = queue.popleft()
+            if xi in self.assignment:
+                continue
+            if self._revise(xi, xj):
+                arcs_revised += 1
+                if not self.domains[xi]:
+                    self.logs.append(f"   [AC-3] Miền giá trị của {xi} rỗng -> Không nhất quán, cần quay lui!")
+                    return False
+                for xk in QUAN_DATA[xi]["adj"]:
+                    if xk != xj and xk not in self.assignment:
+                        queue.append((xk, xi))
+        if arcs_revised:
+            self.logs.append(f"   [AC-3] Lan truyền xong, đã thu hẹp thêm {arcs_revised} cung ràng buộc.")
         return True
 
     def step(self):
@@ -132,12 +187,17 @@ class CSPState:
             self.assignment[var] = color
             self.logs.append(f"   Kiểm tra ràng buộc: Hợp lệ!")
             self.history.append((var, color, saved_domains))
-            
-            self.logs.append(f"   [Kiểm tra trước] Cập nhật miền giá trị các vùng kề của {var}:")
-            for neighbor in QUAN_DATA[var]["adj"]:
-                if neighbor not in self.assignment and color in self.domains[neighbor]:
-                    self.domains[neighbor].remove(color)
-                    self.logs.append(f"     + Miền giá trị của {neighbor} loại bớt màu {color} -> {self.domains[neighbor]}")
+
+            if self.mode in ("fc", "ac3"):
+                self.logs.append(f"   [Forward Checking] Cập nhật miền giá trị các vùng kề của {var}:")
+                for neighbor in QUAN_DATA[var]["adj"]:
+                    if neighbor not in self.assignment and color in self.domains[neighbor]:
+                        self.domains[neighbor].remove(color)
+                        self.logs.append(f"     + Miền giá trị của {neighbor} loại bớt màu {color} -> {self.domains[neighbor]}")
+
+            if self.mode == "ac3":
+                self.ac3()
+
             self.logs.append(f"   Phân hoạch hiện tại = {self.assignment}")
         else:
             self.logs.append(f"   Kiểm tra ràng buộc: Vi phạm trùng màu kề -> Không hợp lệ!")
@@ -151,10 +211,13 @@ N_QUEENS = 8  # Kích thước bàn cờ
 
 class QueensCSP:
     """
-    Mô phỏng từng bước giải bài toán 8-Queens với 3 chiến lược:
-      - 'simple'  : Simple Backtracking (chọn cột theo thứ tự, thử giá trị theo thứ tự)
-      - 'mrv'     : Backtracking + MRV  (chọn cột có ít giá trị hợp lệ nhất)
-      - 'fc'      : Backtracking + Forward Checking (loại trừ miền trước khi đặt quân)
+    Mô phỏng từng bước giải bài toán 8-Queens với 4 chiến lược:
+      - 'simple'      : Simple Backtracking (chọn cột theo thứ tự, thử giá trị theo thứ tự)
+      - 'mrv'         : Backtracking + MRV  (chọn cột có ít giá trị hợp lệ nhất)
+      - 'fc'          : Backtracking + Forward Checking (loại trừ miền trước khi đặt quân)
+      - 'minconflict' : Min-Conflicts (Local Search) - khởi tạo NGẪU NHIÊN đủ 8 quân
+                        (mỗi cột 1 hàng), rồi lặp: chọn 1 cột đang xung đột, di chuyển
+                        quân hậu đó tới hàng có ÍT xung đột nhất, cho đến khi hết xung đột.
     """
     def __init__(self, strategy='simple'):
         self.strategy = strategy
@@ -169,13 +232,77 @@ class QueensCSP:
         self.success = False
         self.nodes_explored = 0
         self.backtracks = 0
+        self.max_mc_steps = 1000   # giới hạn số bước Min-Conflicts để tránh treo vô hạn
         self._add_log(f"Khởi tạo 8-Queens CSP [{strategy.upper()}]")
-        self._add_log(f"Biến: 8 cột (0-7) | Miền: hàng 0-7 | Ràng buộc: không tấn công nhau")
+        if strategy == 'minconflict':
+            # Khởi tạo NGẪU NHIÊN: mỗi cột gán 1 hàng ngẫu nhiên (đủ 8 quân ngay từ đầu)
+            for c in range(self.n):
+                self.assignment[c] = random.randint(0, self.n - 1)
+            self._add_log(f"Biến: 8 cột (0-7) | Khởi tạo ngẫu nhiên đầy đủ: {self.assignment}")
+            self._add_log(f"Số cặp xung đột ban đầu: {self._total_conflicts()}")
+        else:
+            self._add_log(f"Biến: 8 cột (0-7) | Miền: hàng 0-7 | Ràng buộc: không tấn công nhau")
 
     def _add_log(self, msg):
         self.logs.append(msg)
         if len(self.logs) > 200:
             self.logs = self.logs[-200:]
+
+    def _conflicts_for(self, col, row):
+        """Đếm số quân hậu khác xung đột với quân tại (col, row), dùng cho Min-Conflicts."""
+        cnt = 0
+        for c, r in self.assignment.items():
+            if c == col:
+                continue
+            if r == row or abs(c - col) == abs(r - row):
+                cnt += 1
+        return cnt
+
+    def _total_conflicts(self):
+        total = 0
+        for col, row in self.assignment.items():
+            total += self._conflicts_for(col, row)
+        return total // 2  # mỗi cặp xung đột bị đếm 2 lần
+
+    def _conflicted_columns(self):
+        return [c for c in range(self.n) if self._conflicts_for(c, self.assignment[c]) > 0]
+
+    def step_minconflict(self):
+        """Một bước Min-Conflicts: chọn cột xung đột ngẫu nhiên, di chuyển tới hàng ít xung đột nhất."""
+        if self.done:
+            return True
+        self.nodes_explored += 1
+
+        conflicted = self._conflicted_columns()
+        if not conflicted:
+            self._add_log(f"✔ Thành công! Lời giải (Min-Conflicts): {self.assignment}")
+            self.done = True
+            self.success = True
+            return True
+
+        if self.nodes_explored > self.max_mc_steps:
+            self._add_log(f"✘ Đạt giới hạn {self.max_mc_steps} bước mà chưa hội tụ (kẹt cực tiểu địa phương) → Khởi động lại ngẫu nhiên.")
+            for c in range(self.n):
+                self.assignment[c] = random.randint(0, self.n - 1)
+            self.nodes_explored = 0
+            self.backtracks += 1  # dùng chung biến này để đếm số lần "khởi động lại"
+            return False
+
+        col = random.choice(conflicted)
+        best_rows, best_conflict = [], None
+        for r in range(self.n):
+            c_count = self._conflicts_for(col, r)
+            if best_conflict is None or c_count < best_conflict:
+                best_conflict, best_rows = c_count, [r]
+            elif c_count == best_conflict:
+                best_rows.append(r)
+        new_row = random.choice(best_rows)
+        old_row = self.assignment[col]
+        self.assignment[col] = new_row
+        self._add_log(f"Bước {self.nodes_explored}: Cột {col} đang xung đột (hàng {old_row}) "
+                       f"-> chuyển sang hàng {new_row} (số xung đột còn lại: {best_conflict})")
+        self._add_log(f"   Tổng số cặp xung đột hiện tại: {self._total_conflicts()}")
+        return False
 
     def _is_consistent(self, col, row):
         """Kiểm tra quân hậu tại (row, col) có xung đột với các quân đã đặt."""
@@ -227,6 +354,9 @@ class QueensCSP:
 
     def step(self):
         """Thực hiện MỘT bước: thử gán hoặc backtrack. Trả về True khi xong."""
+        if self.strategy == 'minconflict':
+            return self.step_minconflict()
+
         if self.done:
             return True
 
@@ -1135,14 +1265,18 @@ def main():
         Button(690, 73, 110, 23, "BLIND-1 (Goal)", CYAN, "blind1"),
         Button(805, 73, 110, 23, "BLIND-2 (Start)", CYAN, "blind2"),
         Button(920, 73, 115, 23, "BLIND-3 (Partial)", CYAN, "blind3"),
-        Button(1040, 73, 135, 23, "AND-OR Graph Search", ORANGE, "and_or"),
-        
-        Button(1180, 73, 135, 23, "HCMC MAP CSP", PURPLE, "hcmc_csp"),
+        Button(1180, 73, 135, 23, "AND-OR Graph Search", ORANGE, "and_or"),
+
+        # CSP Tô màu bản đồ TP.HCM – 3 chế độ
+        Button(690, 100, 150, 23, "HCMC Backtrack thường", (150, 100, 200), "hcmc_simple"),
+        Button(850, 100, 150, 23, "HCMC Backtrack+FC", PURPLE, "hcmc_csp"),
+        Button(1010, 100, 150, 23, "HCMC Backtrack+AC-3", (40, 160, 200), "hcmc_ac3"),
 
         # NEW: 8-Queens CSP buttons (hàng mới dưới hàng cũ)
         Button(690, 197, 130, 23, "8Q-Simple BT", (180, 100, 220), "q8_simple"),
         Button(825, 197, 130, 23, "8Q-MRV", (220, 140, 60), "q8_mrv"),
-        Button(960, 197, 155, 23, "8Q-Forward Check", (60, 180, 160), "q8_fc"),
+        Button(960, 197, 145, 23, "8Q-ForwardCheck", (60, 180, 160), "q8_fc"),
+        Button(1110, 197, 175, 23, "8Q-MinConflicts(Local)", (210, 80, 130), "q8_minconflict"),
 
         # NEW: Tic-Tac-Toe Game-tree buttons
         Button(690, 226, 130, 23, "TTT-Minimax", (60, 130, 200), "ttt_minimax"),
@@ -1174,9 +1308,9 @@ def main():
         try:
             screen.fill(DARK_GRAY)
         
-            if selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax"):
+            if selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax"):
                 pass  # 8-Queens / Tic-Tac-Toe: không vẽ grid vacuum hay HCMC map ở đây
-            elif selected_algo == "hcmc_csp":
+            elif selected_algo in HCMC_CSP_MODES:
                 pygame.draw.rect(screen, LIGHT_BLACK, (30, 60, 620, 680), border_radius=8)
                 pygame.draw.rect(screen, GRAY, (30, 60, 620, 680), 2, border_radius=8)
                 screen.blit(font_bold.render("SƠ ĐỒ RÀNG BUỘC KỀ NHAU - CÁC QUẬN TP.HCM (CSP)", True, WHITE), (50, 80))
@@ -1268,12 +1402,12 @@ def main():
                         last_update_time = pygame.time.get_ticks()
 
             if is_playing and pygame.time.get_ticks() - last_update_time > 600:
-                if selected_algo == "hcmc_csp":
+                if selected_algo in HCMC_CSP_MODES:
                     if csp_sim:
                         done_csp = csp_sim.step()
                         if done_csp: is_playing = False
                     last_update_time = pygame.time.get_ticks()
-                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc"):
+                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict"):
                     if queens_sim and not queens_sim.done:
                         queens_sim.step()
                         algo_stats["steps"] = queens_sim.nodes_explored
@@ -1323,14 +1457,14 @@ def main():
                     mouse_pos = pygame.mouse.get_pos()
                     for btn in buttons:
                         if btn.rect.collidepoint(mouse_pos):
-                            if btn.action_type in ["bfs1", "bfs2", "dfs1", "dfs2", "ids", "ucs", "greedy", "astar", "idastar", "shill", "sthill", "stochill", "rrhill", "beams", "anneal", "blind1", "blind2", "blind3", "and_or", "hcmc_csp", "q8_simple", "q8_mrv", "q8_fc", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax"]:
+                            if btn.action_type in ["bfs1", "bfs2", "dfs1", "dfs2", "ids", "ucs", "greedy", "astar", "idastar", "shill", "sthill", "stochill", "rrhill", "beams", "anneal", "blind1", "blind2", "blind3", "and_or", "hcmc_csp", "hcmc_simple", "hcmc_ac3", "q8_simple", "q8_mrv", "q8_fc", "q8_minconflict", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax"]:
                                 selected_algo = btn.action_type
                                 animation_index, solution_nodes = -1, []
                                 is_playing = False
-                                if selected_algo == "hcmc_csp":
-                                    csp_sim = CSPState()
-                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc"):
-                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc"}
+                                if selected_algo in HCMC_CSP_MODES:
+                                    csp_sim = CSPState(mode=HCMC_MODE_MAP.get(selected_algo, "fc"))
+                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict"):
+                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc", "q8_minconflict": "minconflict"}
                                     queens_sim = QueensCSP(strategy=strategy_map[selected_algo])
                                 elif selected_algo in ("ttt_minimax", "ttt_alphabeta", "ttt_expectimax"):
                                     ttt_strategy_map = {"ttt_minimax": "minimax", "ttt_alphabeta": "alphabeta", "ttt_expectimax": "expectimax"}
@@ -1354,10 +1488,10 @@ def main():
                                 animation_index, solution_nodes = -1, []
                             elif btn.action_type == "reset":
                                 env.generate_map()
-                                if selected_algo == "hcmc_csp":
-                                    csp_sim = CSPState()
-                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc"):
-                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc"}
+                                if selected_algo in HCMC_CSP_MODES:
+                                    csp_sim = CSPState(mode=HCMC_MODE_MAP.get(selected_algo, "fc"))
+                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict"):
+                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc", "q8_minconflict": "minconflict"}
                                     queens_sim = QueensCSP(strategy=strategy_map[selected_algo])
                                 elif selected_algo in ("ttt_minimax", "ttt_alphabeta", "ttt_expectimax"):
                                     ttt_strategy_map = {"ttt_minimax": "minimax", "ttt_alphabeta": "alphabeta", "ttt_expectimax": "expectimax"}
@@ -1367,12 +1501,12 @@ def main():
                                 animation_index, is_playing = -1, False
                                 algo_stats = {"steps": 0, "frontier": 0, "reached": 0, "status": "Map Reset", "path_len": 0}
                             elif btn.action_type == "start":
-                                if selected_algo == "hcmc_csp":
-                                    csp_sim = CSPState()
+                                if selected_algo in HCMC_CSP_MODES:
+                                    csp_sim = CSPState(mode=HCMC_MODE_MAP.get(selected_algo, "fc"))
                                     is_playing = True
                                     algo_stats["status"] = "CSP Backtracking..."
-                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc"):
-                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc"}
+                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict"):
+                                    strategy_map = {"q8_simple": "simple", "q8_mrv": "mrv", "q8_fc": "fc", "q8_minconflict": "minconflict"}
                                     queens_sim = QueensCSP(strategy=strategy_map[selected_algo])
                                     is_playing = True
                                     algo_stats["status"] = f"8-Queens [{strategy_map[selected_algo].upper()}] Running..."
@@ -1416,13 +1550,13 @@ def main():
                                         algo_stats["status"] = "No Solution/Plan Found!"
                             elif btn.action_type == "prev_step":
                                 is_playing = False
-                                if selected_algo not in ("hcmc_csp", "q8_simple", "q8_mrv", "q8_fc", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax") and len(solution_nodes) > 0 and animation_index > 0:
+                                if selected_algo not in HCMC_CSP_MODES + ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict", "ttt_minimax", "ttt_alphabeta", "ttt_expectimax") and len(solution_nodes) > 0 and animation_index > 0:
                                     animation_index -= 1
                             elif btn.action_type == "next_step":
                                 is_playing = False
-                                if selected_algo == "hcmc_csp" and csp_sim:
+                                if selected_algo in HCMC_CSP_MODES and csp_sim:
                                     csp_sim.step()
-                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc") and queens_sim:
+                                elif selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict") and queens_sim:
                                     if not queens_sim.done:
                                         queens_sim.step()
                                 elif len(solution_nodes) > 0 and animation_index < len(solution_nodes) - 1:
@@ -1450,7 +1584,7 @@ def main():
             pygame.draw.rect(screen, LIGHT_BLACK, (panel_x, panel_y, panel_w, panel_h), border_radius=8)
             pygame.draw.rect(screen, GRAY, (panel_x, panel_y, panel_w, panel_h), 2, border_radius=8)
         
-            if selected_algo in ("q8_simple", "q8_mrv", "q8_fc"):
+            if selected_algo in ("q8_simple", "q8_mrv", "q8_fc", "q8_minconflict"):
                 # ============================================================
                 # RENDER 8-QUEENS: Bàn cờ bên trái + Logs bên phải
                 # ============================================================
@@ -1459,7 +1593,7 @@ def main():
                 cell = board_size // N_QUEENS
                 bx0, by0 = 50, 80
 
-                strat_names = {"q8_simple": "Simple Backtracking", "q8_mrv": "Backtracking + MRV", "q8_fc": "Backtracking + Forward Checking"}
+                strat_names = {"q8_simple": "Simple Backtracking", "q8_mrv": "Backtracking + MRV", "q8_fc": "Backtracking + Forward Checking", "q8_minconflict": "Min-Conflicts (Local Search)"}
                 screen.blit(font_bold.render(f"8-QUEENS CSP  –  {strat_names[selected_algo]}", True, WHITE), (bx0, by0 - 25))
 
                 for row in range(N_QUEENS):
@@ -1507,9 +1641,14 @@ def main():
                     pygame.draw.line(screen, GRAY, (panel_x+10, y_log+4), (panel_x+panel_w-10, y_log+4), 1)
                     y_log += 14
                     screen.blit(font_bold.render("THỐNG KÊ:", True, ORANGE), (panel_x + 10, y_log)); y_log += 22
-                    screen.blit(font.render(f"Nodes explored : {queens_sim.nodes_explored}", True, WHITE), (panel_x+10, y_log)); y_log += 20
-                    screen.blit(font.render(f"Backtracks     : {queens_sim.backtracks}", True, WHITE), (panel_x+10, y_log)); y_log += 20
-                    screen.blit(font.render(f"Queens placed  : {len(queens_sim.assignment)} / 8", True, WHITE), (panel_x+10, y_log)); y_log += 20
+                    steps_label = "Số bước local search" if queens_sim.strategy == "minconflict" else "Nodes explored"
+                    screen.blit(font.render(f"{steps_label} : {queens_sim.nodes_explored}", True, WHITE), (panel_x+10, y_log)); y_log += 20
+                    bt_label = "Restarts (kẹt cực tiểu)" if queens_sim.strategy == "minconflict" else "Backtracks"
+                    screen.blit(font.render(f"{bt_label} : {queens_sim.backtracks}", True, WHITE), (panel_x+10, y_log)); y_log += 20
+                    if queens_sim.strategy == "minconflict":
+                        screen.blit(font.render(f"Số cặp xung đột hiện tại: {queens_sim._total_conflicts()}", True, WHITE), (panel_x+10, y_log)); y_log += 20
+                    else:
+                        screen.blit(font.render(f"Queens placed  : {len(queens_sim.assignment)} / 8", True, WHITE), (panel_x+10, y_log)); y_log += 20
                     status_clr = GREEN if queens_sim.success else (RED if queens_sim.done else YELLOW)
                     status_txt = "✔ SOLVED!" if queens_sim.success else ("✘ NO SOLUTION" if queens_sim.done else "Đang giải...")
                     screen.blit(font_bold.render(f"Trạng thái: {status_txt}", True, status_clr), (panel_x+10, y_log))
@@ -1574,8 +1713,9 @@ def main():
                     y_log += 6
                     draw_multiline_text(screen, algo_explain[selected_algo], panel_x+10, y_log, panel_w - 30, font_small, CYAN)
 
-            elif selected_algo == "hcmc_csp":
-                screen.blit(font_bold.render("MÔ PHỎNG TỪNG BƯỚC TÌM LỜI GIẢI - CSP", True, YELLOW), (700, panel_y + 10))
+            elif selected_algo in HCMC_CSP_MODES:
+                csp_mode_titles = {"hcmc_simple": "Backtracking thường", "hcmc_csp": "Backtracking + Forward Checking", "hcmc_ac3": "Backtracking + AC-3 Inference"}
+                screen.blit(font_bold.render(f"MÔ PHỎNG TỪNG BƯỚC TÌM LỜI GIẢI - CSP [{csp_mode_titles.get(selected_algo, '')}]", True, YELLOW), (700, panel_y + 10))
                 y_pos = panel_y + 35
                 if csp_sim:
                     for log in csp_sim.logs[-11:]:
