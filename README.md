@@ -42,4 +42,5 @@ Mục tiêu là tô màu 15 quận/huyện của TP.HCM bằng 4 màu sao cho kh
 2. Gõ câu lệnh sau và nhấn *Enter* để cài đặt tự động:
    ```bash
    pip install pygame
-   https://github.com/user-attachments/assets/eec26248-e837-4dea-8396-a364cda4690e
+
+https://github.com/user-attachments/assets/eec26248-e837-4dea-8396-a364cda4690e
